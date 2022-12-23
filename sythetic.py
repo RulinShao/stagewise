@@ -89,8 +89,9 @@ def generate_data(num_data, num_modalities, feature_dim_info, label_dim_info, tr
     # get label vector
     label_components = []
     for k,d in label_dim_info.items():
-      label_components.append(raw_features[k][:d])
-   
+      if np.random.uniform(0.0,1.0, 1)>=0.3 and len(k)==2: # otherwise, label responsibel for all iteractions
+        label_components.append(raw_features[k][:d])  
+
     label_vector = np.concatenate(label_components + [np.random.randint(0, 2, 1)]) 
     label_prob = 1 / (1 + math.exp(-np.mean(label_vector)))
     total_labels.append([int(label_prob >= 0.5)])
@@ -314,7 +315,7 @@ if __name__ == '__main__':
   device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
   # Hyperparameters
-  A_dim, B_dim = 100, 100
+  # A_dim, B_dim = 100, 100
   label_dim = 1
   lr = 1e-4
   hidden_dim=512 
@@ -327,7 +328,7 @@ if __name__ == '__main__':
   num_data = 10000
   batch_size = 512
   train_loader, test_loader = get_data_loaders(num_modalities, num_data, batch_size)
-
+  
   EPOCHS = 100
 
   model_list = []
