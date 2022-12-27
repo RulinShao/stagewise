@@ -1,0 +1,253 @@
+import numpy as np
+import pandas as pd
+import os
+import time 
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.linear_model import LogisticRegression, LinearRegression, LassoLars
+from sklearn.decomposition import FastICA
+from sklearn.preprocessing import normalize
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+
+from sythetic import MultimodalDataset, get_intersections
+from independent_stagewise import (
+    get_res_y, 
+    get_res_y_2, 
+    add_res_y, 
+    add_res_y_2,
+)
+
+def calculate_accuracy(y_pred, y):
+    y_pred, y = torch.tensor(y_pred), torch.tensor(y)
+    pred = (y_pred >= 0.5).float()
+    acc = (pred == y).sum() / y.shape[0]
+    return acc.item()
+
+def mean_squared_error(pred, act):
+    pred, act = torch.tensor(pred), torch.tensor(act)
+    diff = pred - act
+    differences_squared = diff ** 2
+    mean_diff = differences_squared.mean()
+    return mean_diff.item()
+
+def get_corr(X, y):
+    corr, _ = pearsonr(X, y)
+    return corr
+
+########################## Load Raw Data ##########################
+df = pd.read_csv(os.path.join('~/data/', 'HomeC.csv'), low_memory=False)
+print(df.head(), '\n', df.columns)
+
+########################## Data Preprocessing ##########################
+# Rename columns to remove spaces and the kW unit 
+df.columns = [col[:-5].replace(' ','_') if 'kW' in col else col for col in df.columns]
+
+# Drop rows with nan values 
+df = df.dropna()
+
+# The columns "use" and "house_overall" are the same, so let's remove the 'house_overall' column
+df.drop(['House_overall'], axis=1, inplace=True)
+
+# The columns "gen" and "solar" are the same, so let's remove the 'solar' column
+df.drop(['Solar'], axis=1, inplace=True)
+
+# drop rows with cloudCover column values that are not numeric (bug in sensors) and convert column to numeric
+df = df[df['cloudCover']!='cloudCover']
+df["cloudCover"] = pd.to_numeric(df["cloudCover"])
+
+# Create columns that regroup kitchens and furnaces 
+df['kitchen'] = df['Kitchen_12'] + df['Kitchen_14'] + df['Kitchen_38']
+df['Furnace'] = df['Furnace_1'] + df['Furnace_2']
+
+# Convert "time" column (which is a unix timestamp) to a Y-m-d H-M-S 
+start_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(df['time'].iloc[0])))
+time_index = pd.date_range(start_time, periods=len(df), freq='min')  
+time_index = pd.DatetimeIndex(time_index)
+df = df.set_index(time_index)
+df = df.drop(['time'], axis=1)
+
+print(df.shape, '\n', df.columns)
+
+########################## Modeling ##########################
+# Task: Predicting future energy consumption by utilizing weather information
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Hyper-parameters
+num_modalities = 5
+corr_threshold = -1.0
+use_independent = False
+use_dependent = True
+criterion = mean_squared_error
+
+# Define datasets and labels TODO: transform icon and summary to one-hot
+df_weather = df[['temperature',
+    #    'icon', 
+       'humidity', 'visibility', 
+    #    'summary', 
+       'apparentTemperature',
+       'pressure', 'windSpeed', 'cloudCover', 'windBearing', 'precipIntensity',
+       'dewPoint', 'precipProbability', 'use']]
+print(df_weather.shape, '\n', df_weather.head(), print(df_weather.dtypes))
+
+# Drop dulicated rows
+df_weather = df_weather.drop_duplicates()
+
+# Select modalities
+df_weather = df_weather.iloc[:, [i for i in range(num_modalities)] + [-1]]
+
+# Normalization
+for column in df_weather.columns:
+    df_weather[column] = (df_weather[column] -
+                           df_weather[column].mean()) / df_weather[column].std()    
+  
+
+# Train test split
+df_train = df_weather.sample(frac = 0.8)
+df_test = df_weather.drop(df_train.index)
+print(df_weather.shape, df_train.shape, df_test.shape)
+
+y_train = df_train[['use']].values.ravel()
+X_train = df_train.drop(columns=['use'])
+y_test = df_test[['use']].values.ravel()
+X_test = df_test.drop(columns=['use'])
+
+# ICA
+ICA = FastICA(n_components=num_modalities, random_state=0, whiten='unit-variance')
+ica_X_train = ICA.fit_transform(X_train)
+ica_X_test = ICA.transform(X_test)
+
+# dependent components
+dependent_X_train = np.array(X_train) - ica_X_train
+dependent_X_test = np.array(X_test) - ica_X_test
+
+# Compute correlations
+intersections = get_intersections(num_modalities=num_modalities)
+uni_modal_index = [inter for inter in intersections if len(inter)==1 ]
+bi_intersections = [inter for inter in intersections if len(inter)==2 ]
+remain_modalities = [i for i in range(num_modalities)]
+
+# Train
+print(f"Start Training...")
+model_list = []
+test_score_list = []
+corr_list = []
+
+# First model
+corrs_ = [get_corr(ica_X_train[:, i], y_train) for i in remain_modalities]
+corrs = [abs(x) for x in corrs_]
+modality_index = corrs.index(max(corrs))
+remain_modalities.remove(modality_index)
+
+if not max(corrs) < corr_threshold:
+    corr_list.append(max(corrs))
+    
+    print(f'Training unimodal model for modality {modality_index}..')
+    model = LinearRegression().fit(ica_X_train[:, modality_index:modality_index+1], y_train)
+    y_pred = model.predict(ica_X_test[:, modality_index:modality_index+1])
+    test_score = criterion(y_pred, y_test)
+    print(f"**(unimodal)** Modality: {modality_index}, corr: {corrs_[corrs.index(max(corrs))]:.4f}, mse: {test_score:.4f}")
+    model_list.append({'model': model, 'modality':[modality_index]})
+    test_score_list.append(test_score)
+
+# Residual uni-model
+while remain_modalities:
+    y_train_res = get_res_y(model_list, ica_X_train, y_train)
+
+    corrs_ = [get_corr(ica_X_train[:, i], y_train_res) for i in remain_modalities]
+    corrs = [abs(x) for x in corrs_]
+    modality_index = remain_modalities[corrs.index(max(corrs))]
+    remain_modalities.remove(modality_index)
+
+    if not max(corrs) < corr_threshold:
+        corr_list.append(max(corrs))
+    
+        model = LinearRegression().fit(ica_X_train[:, [modality_index]], y_train_res)
+        y_pred = model.predict(ica_X_test[:, [modality_index]])
+        y_res = add_res_y(model_list, ica_X_test)
+        test_score = criterion(y_pred+y_res, y_test)
+        print(f"**(unimodal)** Modality: {modality_index}, corr: {corrs_[corrs.index(max(corrs))]:.4f}, test score: {test_score:.4f}")
+        
+        model_list.append({'model': model, 'modality':[modality_index]})
+        test_score_list.append(test_score)
+
+# Residual bi-model (independent)
+if use_independent:
+    while bi_intersections:
+        y_train_res = get_res_y(model_list, dependent_X_train, y_train)
+
+        corrs_ = []
+        for inter in bi_intersections:
+            modality_index = [int(inter[0])-1, int(inter[1])-1]
+            X_train_ = np.multiply(ica_X_train[:, modality_index[0]], ica_X_train[:, modality_index[1]])
+            corrs_.append(get_corr(X_train_, y_train_res))
+        corrs = [abs(x) for x in corrs_]
+        inter = bi_intersections[corrs.index(max(corrs))]
+        modality_index = [int(inter[0])-1, int(inter[1])-1]
+        bi_intersections.remove(inter)
+
+        if not max(corrs) < corr_threshold:
+            corr_list.append(max(corrs))
+        
+            # X_train_ = np.multiply(ica_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]])
+            X_train_ = ica_X_train[:, modality_index]
+            from sklearn.neural_network import MLPRegressor
+            model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
+            # model = LinearRegression().fit(X_train_, y_train_res)
+
+            # X_test_ = np.multiply(ica_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]])
+            X_test_ = ica_X_test[:, modality_index]
+            y_pred = model.predict(X_test_)
+            y_res = add_res_y(model_list, ica_X_test)
+            test_score = criterion(y_pred+y_res, y_test)
+            print(f"**(independent)** Modality: {modality_index}, corr: {corrs_[corrs.index(max(corrs))]:.4f}, test score: {test_score:.4f}")
+            
+            model_list.append({'model': model, 'modality':modality_index})
+            test_score_list.append(test_score)
+
+# Residual bi-model (dependent)
+if use_dependent:
+    bi_intersections = [inter for inter in intersections if len(inter)==2 ]
+    y_train_res_old = get_res_y(model_list, ica_X_train, y_train)
+    y_test_res_old = add_res_y(model_list, ica_X_test)
+
+    model_list = []
+    while bi_intersections:
+        y_train_res = get_res_y_2(model_list, dependent_X_train, ica_X_train, y_train_res_old) if len(model_list) else y_train_res_old
+
+        corrs_ = []
+        for inter in bi_intersections:
+            modality_index = [int(inter[0])-1, int(inter[1])-1]
+            X_train_ = np.multiply(dependent_X_train[:, modality_index[0]], ica_X_train[:, modality_index[1]])
+            corrs_.append(get_corr(X_train_, y_train_res))
+        corrs = [abs(x) for x in corrs_]
+        inter = bi_intersections[corrs.index(max(corrs))]
+        modality_index = [int(inter[0])-1, int(inter[1])-1]
+        bi_intersections.remove(inter)
+
+        if not max(corrs) < corr_threshold:
+            corr_list.append(max(corrs))
+        
+            # X_train_ = np.multiply(ica_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]])
+            X_train_ = np.concatenate((dependent_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]]), axis=1)
+            from sklearn.neural_network import MLPRegressor
+            model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
+            # model = LinearRegression().fit(X_train_, y_train_res)
+
+            # X_test_ = np.multiply(ica_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]])
+            X_test_ = np.concatenate((dependent_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]]), axis=1)
+            y_pred = model.predict(X_test_)
+            y_res = add_res_y_2(model_list, dependent_X_test, ica_X_test) if len(model_list) else np.zeros_like(y_test)
+            test_score = criterion(y_pred+y_res+y_test_res_old, y_test)
+            print(f"**(dependent)** Modality: {modality_index}, corr: {corrs_[corrs.index(max(corrs))]:.4f}, test score: {test_score:.4f}")
+            
+            model_list.append({'model': model, 'modality':modality_index})
+            test_score_list.append(test_score)
+
+print('corr threshold: ', corr_threshold)
+print('test acc: ', test_score_list)
+print('abs corr: ', corr_list)
+
+plt.figure(0)
+plt.plot([x for x in range(len(test_score_list))], test_score_list)
+plt.savefig('score.png')
