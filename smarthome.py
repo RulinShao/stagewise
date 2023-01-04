@@ -5,10 +5,12 @@ import time
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.linear_model import LogisticRegression, LinearRegression, LassoLars
+from sklearn.neural_network import MLPRegressor
 from sklearn.decomposition import FastICA
-from sklearn.preprocessing import normalize
+# from sklearn.preprocessing import normalize
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
+import random
 
 from sythetic import MultimodalDataset, get_intersections
 from independent_stagewise import (
@@ -17,6 +19,12 @@ from independent_stagewise import (
     add_res_y, 
     add_res_y_2,
 )
+
+
+seed = 10
+random.seed(seed)
+np.random.seed(seed)
+
 
 def calculate_accuracy(y_pred, y):
     y_pred, y = torch.tensor(y_pred), torch.tensor(y)
@@ -34,6 +42,22 @@ def mean_squared_error(pred, act):
 def get_corr(X, y):
     corr, _ = pearsonr(X, y)
     return corr
+
+def normalization(data, normalization_method='uniform', data_type='df'):
+    if data_type == 'df':
+        if normalization_method == 'uniform':  # into range [0, 1]
+            for column in data.columns:
+                data[column] = (data[column] -  data[column].min()) / (data[column].max() - data[column].min())
+        else:
+            for column in data.columns:  # into N(0, 1)
+                data[column] = (data[column] -
+                                    data[column].mean()) / data[column].std()  
+    else:
+        if normalization_method == 'uniform':  # into range [0, 1]
+            data = (data - np.amin(data, axis=0)) / (np.amax(data, axis=0) - np.amin(data, axis=0))
+        else:
+            data = (data - np.mean(data, axis=0)) / np.std(data, axis=0)  
+    return data
 
 ########################## Load Raw Data ##########################
 df = pd.read_csv(os.path.join('~/data/', 'HomeC.csv'), low_memory=False)
@@ -74,11 +98,17 @@ print(df.shape, '\n', df.columns)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Hyper-parameters
-num_modalities = 5
+num_modalities = 10
 corr_threshold = -1.0
-use_independent = False
-use_dependent = True
+use_independent = True
+use_dependent = False
+interaction_model = 'mlp' # 'linear' MLPRegressor or LinearRegression
 criterion = mean_squared_error
+
+use_ica = True  # default: True (for baseline comparison)
+if not use_ica:
+    use_independent = True
+    use_dependent = False
 
 # Define datasets and labels TODO: transform icon and summary to one-hot
 df_weather = df[['temperature',
@@ -97,13 +127,13 @@ df_weather = df_weather.drop_duplicates()
 df_weather = df_weather.iloc[:, [i for i in range(num_modalities)] + [-1]]
 
 # Normalization
-for column in df_weather.columns:
-    df_weather[column] = (df_weather[column] -
-                           df_weather[column].mean()) / df_weather[column].std()    
-  
+normalization_method = 'normal'
+df_weather = normalization(df_weather, normalization_method, data_type='df') 
+print(sum(df_weather.iloc[:, 0]), max(df_weather.iloc[:, 0]), min(df_weather.iloc[:, 0]))
+print(df_weather.iloc[:, 0].mean(), df_weather.iloc[:, 0].std)
 
 # Train test split
-df_train = df_weather.sample(frac = 0.8)
+df_train = df_weather.sample(frac = 0.8, random_state=seed)
 df_test = df_weather.drop(df_train.index)
 print(df_weather.shape, df_train.shape, df_test.shape)
 
@@ -113,9 +143,18 @@ y_test = df_test[['use']].values.ravel()
 X_test = df_test.drop(columns=['use'])
 
 # ICA
-ICA = FastICA(n_components=num_modalities, random_state=0, whiten='unit-variance')
-ica_X_train = ICA.fit_transform(X_train)
-ica_X_test = ICA.transform(X_test)
+if use_ica:
+    ICA = FastICA(n_components=num_modalities, random_state=0, whiten='unit-variance')
+    ica_X_train = ICA.fit_transform(X_train)
+    ica_X_test = ICA.transform(X_test)
+    print(np.mean(ica_X_train[:, 0], axis=0), np.std(ica_X_train[:, 0], axis=0))
+else:
+    ica_X_train = np.array(X_train)
+    ica_X_test = np.array(X_test)
+# ica_X_train = normalization(ica_X_train, normalization_method=normalization_method, data_type='np')
+# ica_X_test = normalization(ica_X_test, normalization_method=normalization_method, data_type='np')
+# print(sum(ica_X_train[:, 0]), max(ica_X_train[:, 0]), min(ica_X_train[:, 0]))
+# print(np.mean(ica_X_train[:, 0], axis=0), np.std(ica_X_train[:, 0], axis=0))
 
 # dependent components
 dependent_X_train = np.array(X_train) - ica_X_train
@@ -174,7 +213,8 @@ while remain_modalities:
 # Residual bi-model (independent)
 if use_independent:
     while bi_intersections:
-        y_train_res = get_res_y(model_list, dependent_X_train, y_train)
+        y_train_res = get_res_y(model_list, ica_X_train, y_train)
+        # NOTE: checked the two functions are the same
 
         corrs_ = []
         for inter in bi_intersections:
@@ -191,9 +231,10 @@ if use_independent:
         
             # X_train_ = np.multiply(ica_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]])
             X_train_ = ica_X_train[:, modality_index]
-            from sklearn.neural_network import MLPRegressor
-            model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
-            # model = LinearRegression().fit(X_train_, y_train_res)
+            if interaction_model == 'mlp':
+                model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
+            elif interaction_model == 'linear':
+                model = LinearRegression().fit(X_train_, y_train_res)
 
             # X_test_ = np.multiply(ica_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]])
             X_test_ = ica_X_test[:, modality_index]
@@ -230,9 +271,10 @@ if use_dependent:
         
             # X_train_ = np.multiply(ica_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]])
             X_train_ = np.concatenate((dependent_X_train[:, [modality_index[0]]], ica_X_train[:, [modality_index[1]]]), axis=1)
-            from sklearn.neural_network import MLPRegressor
-            model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
-            # model = LinearRegression().fit(X_train_, y_train_res)
+            if interaction_model == 'mlp':
+                model = MLPRegressor(random_state=1, max_iter=500).fit(X_train_, y_train_res)
+            elif interaction_model == 'linear':
+                model = LinearRegression().fit(X_train_, y_train_res)
 
             # X_test_ = np.multiply(ica_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]])
             X_test_ = np.concatenate((dependent_X_test[:, [modality_index[0]]], ica_X_test[:, [modality_index[1]]]), axis=1)

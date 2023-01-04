@@ -22,11 +22,8 @@ def get_corr(X, y):
 def get_res_y(model_list, X, y):
     for model in model_list:
         modality_index = model['modality']
-        if len(modality_index) == 1:
-            X_train_ = X[:, modality_index]
-        else:
-            X_train_ = X[:, modality_index]
-            # X_train_ = np.multiply(X[:, [modality_index[0]]], X[:, [modality_index[1]]])
+        X_train_ = X[:, modality_index]
+        # X_train_ = np.multiply(X[:, [modality_index[0]]], X[:, [modality_index[1]]])
         y_pred = model['model'].predict(X_train_)
         y = y - y_pred
     return y
@@ -34,7 +31,10 @@ def get_res_y(model_list, X, y):
 def get_res_y_2(model_list, X_1, X_2, y):
     for model in model_list:
         modality_index = model['modality']
-        X_train_ = np.concatenate((X_1[:, [modality_index[0]]], X_2[:, [modality_index[1]]]), axis=1)
+        if len(modality_index) == 1:
+            X_train_ = X_1[:, modality_index]
+        else:
+            X_train_ = np.concatenate((X_1[:, [modality_index[0]]], X_2[:, [modality_index[1]]]), axis=1)
         y_pred = model['model'].predict(X_train_)
         y = y - y_pred
     return y
@@ -42,11 +42,8 @@ def get_res_y_2(model_list, X_1, X_2, y):
 def add_res_y(model_list, X):
     for i, model in enumerate(model_list):
         modality_index = model['modality']
-        if len(modality_index) == 1:
-            X_train_ = X[:, modality_index]
-        else:
-            X_train_ = X[:, modality_index]
-            # X_train_ = np.multiply(X[:, [modality_index[0]]], X[:, [modality_index[1]]])
+        X_train_ = X[:, modality_index]
+        # X_train_ = np.multiply(X[:, [modality_index[0]]], X[:, [modality_index[1]]])
         
         if i == 0:   
             y = model['model'].predict(X_train_)
@@ -57,7 +54,10 @@ def add_res_y(model_list, X):
 def add_res_y_2(model_list, X_1, X_2):
     for i, model in enumerate(model_list):
         modality_index = model['modality']
-        X_train_ = np.concatenate((X_1[:, [modality_index[0]]], X_2[:, [modality_index[1]]]), axis=1)
+        if len(modality_index) == 1:
+            X_train_ = X_1[:, modality_index]
+        else:
+            X_train_ = np.concatenate((X_1[:, [modality_index[0]]], X_2[:, [modality_index[1]]]), axis=1)
         
         if i == 0:   
             y = model['model'].predict(X_train_)
