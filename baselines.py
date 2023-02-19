@@ -51,7 +51,8 @@ class EarlyFusion(nn.Module):
     
     def forward(self, x):
         h = F.relu(self.layer1(x))
-        out = torch.tanh(self.layer2(h))
+        # out = torch.tanh(self.layer2(h))
+        out = self.layer2(h)
         return out
 
 
@@ -65,7 +66,8 @@ class LateFusion(nn.Module):
 
     def forward(self, x):
         hs = [F.relu(self.encoders[i](x[:, i:i+1])) for i in range(self.num_modalities)]
-        out = torch.tanh(self.mlp(torch.concat(hs, dim=1)))
+        # out = torch.tanh(self.mlp(torch.concat(hs, dim=1)))
+        out = self.mlp(torch.concat(hs, dim=1))
         return out
 
 
@@ -169,7 +171,7 @@ print(df.shape, '\n', df.columns)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Hyper-parameters
-num_modalities = 5
+num_modalities = 10
 batch_size = 128
 criterion = nn.MSELoss()
 
@@ -217,11 +219,28 @@ test_loader = DataLoader(test_dataset, shuffle=False, drop_last=False,
                         batch_size=batch_size,
                         num_workers=4)
 
-# Early Fusion
-model = LateFusion(num_modalities)
-optimizer = optim.Adam(model.parameters(), lr=4e-5)
-num_epochs = 30
-for i in range(num_epochs):
-    train_loss = train_EF(model, train_loader, optimizer, criterion)
-    test_loss = eval_EF(model, test_loader, criterion)
-    print(f"***Epoch {i}, train loss: {train_loss:.4f}, test loss: {test_loss:.4f}")
+
+early_fusion_losses, late_fusion_losses = [], []
+for _ in range(3):  # run 3 times
+    # Early Fusion
+    model = EarlyFusion(num_modalities)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    num_epochs = 30
+    for i in range(num_epochs):
+        train_loss = train_EF(model, train_loader, optimizer, criterion)
+        test_loss = eval_EF(model, test_loader, criterion)
+        print(f"***Epoch {i}, train loss: {train_loss:.4f}, test loss: {test_loss:.4f}")
+    early_fusion_losses.append(test_loss)
+
+    # Late Fusion
+    model = LateFusion(num_modalities)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    num_epochs = 30
+    for i in range(num_epochs):
+        train_loss = train_EF(model, train_loader, optimizer, criterion)
+        test_loss = eval_EF(model, test_loader, criterion)
+        print(f"***Epoch {i}, train loss: {train_loss:.4f}, test loss: {test_loss:.4f}")
+    late_fusion_losses.append(test_loss)
+
+print(f"Finished Training!\n ***Early fusion: {early_fusion_losses}\n ***Late fusion: {late_fusion_losses}")
+print(f"***Mean of Early Fusion: {sum(early_fusion_losses)/len(early_fusion_losses)}\n ***Mean of Late Fusion: {sum(late_fusion_losses)/len(late_fusion_losses)}")
